@@ -4,7 +4,6 @@ import android.Manifest
 import android.content.ComponentName
 import android.content.Context
 import android.content.Intent
-import android.media.audiofx.LoudnessEnhancer
 import android.net.Uri
 import android.os.Build
 import android.os.Bundle
@@ -34,15 +33,10 @@ import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.ArrowBack
 import androidx.compose.material.icons.filled.Close
-import androidx.compose.material.icons.filled.FileDownload
-import androidx.compose.material.icons.filled.FileUpload
 import androidx.compose.material.icons.filled.Menu
-import androidx.compose.material.icons.filled.Pause
 import androidx.compose.material.icons.filled.PlayArrow
 import androidx.compose.material.icons.filled.Refresh
-import androidx.compose.material.icons.filled.Repeat
 import androidx.compose.material.icons.filled.Settings
-import androidx.compose.material.icons.filled.Shuffle
 import androidx.compose.material3.Button
 import androidx.compose.material3.ButtonDefaults
 import androidx.compose.material3.Card
@@ -75,7 +69,6 @@ import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.core.content.ContextCompat
-import androidx.media3.common.C
 import androidx.media3.common.MediaItem
 import androidx.media3.common.Player
 import androidx.media3.session.MediaController
@@ -109,10 +102,12 @@ class MainActivity : ComponentActivity() {
     }
 }
 
-private fun sliderToPlayerVolume(sliderValue: Float): Float {
+private fun sliderToPlayerVolume(sliderValue: Float, boostPercent: Float): Float {
     if (sliderValue <= 0f) return 0f
     val normalized = (sliderValue / 100f).coerceIn(0f, 1f)
-    return (0.0005f * (2000f.pow(normalized))).coerceIn(0f, 1f)
+    val base = 0.0005f * (2000f.pow(normalized))
+    val boostFactor = 1f + (boostPercent.coerceIn(0f, 100f) / 100f) * 0.5f
+    return (base * boostFactor).coerceIn(0f, 1f)
 }
 
 private data class TrackEntry(
@@ -163,8 +158,6 @@ fun QuietPlayerScreen(activity: ComponentActivity) {
     var redHintText by remember { mutableStateOf<String?>(null) }
     var redHintTick by remember { mutableIntStateOf(0) }
 
-    var loudnessEnhancer by remember { mutableStateOf<LoudnessEnhancer?>(null) }
-
     val displayedTracks: List<TrackEntry> = remember(playlistMode, phoneTracks, playlists, activePlaylistIndex) {
         if (playlistMode) {
             playlists.getOrNull(activePlaylistIndex)?.tracks ?: emptyList()
@@ -179,19 +172,7 @@ fun QuietPlayerScreen(activity: ComponentActivity) {
     }
 
     fun applyVolumeAndBoost(volSlider: Float, boost: Float) {
-        controller?.volume = sliderToPlayerVolume(volSlider)
-        val sessionId = controller?.audioSessionId ?: 0
-        if (sessionId != 0 && sessionId != C.AUDIO_SESSION_ID_UNSET) {
-            try {
-                if (loudnessEnhancer == null) {
-                    loudnessEnhancer = LoudnessEnhancer(sessionId)
-                }
-                val gainMb = ((boost / 100f) * 1200).toInt().coerceAtLeast(0)
-                loudnessEnhancer?.setTargetGain(gainMb)
-                loudnessEnhancer?.enabled = gainMb > 0
-            } catch (_: Exception) {
-            }
-        }
+        controller?.volume = sliderToPlayerVolume(volSlider, boost)
     }
 
     fun persistLists() {
@@ -234,7 +215,7 @@ fun QuietPlayerScreen(activity: ComponentActivity) {
         future.addListener({
             val mc = future.get()
             controller = mc
-            mc.volume = sliderToPlayerVolume(sliderVolume)
+            mc.volume = sliderToPlayerVolume(sliderVolume, boostPercent)
             if (displayedTracks.isNotEmpty()) {
                 mc.setMediaItems(displayedTracks.map { MediaItem.fromUri(Uri.parse(it.uriString)) }, 0, 0L)
                 mc.prepare()
@@ -242,8 +223,6 @@ fun QuietPlayerScreen(activity: ComponentActivity) {
         }, ContextCompat.getMainExecutor(activity))
 
         onDispose {
-            loudnessEnhancer?.release()
-            loudnessEnhancer = null
             MediaController.releaseFuture(future)
         }
     }
@@ -388,8 +367,12 @@ fun QuietPlayerScreen(activity: ComponentActivity) {
                     verticalAlignment = Alignment.CenterVertically,
                     horizontalArrangement = Arrangement.spacedBy(8.dp)
                 ) {
-                    IconButton(
-                        onClick = {
+                    Text(
+                        text = if (isPlaying) "||" else ">",
+                        color = Color.White,
+                        fontSize = 15.sp,
+                        fontWeight = FontWeight.Bold,
+                        modifier = Modifier.clickable {
                             controller?.let {
                                 if (it.isPlaying) {
                                     it.pause()
@@ -406,18 +389,15 @@ fun QuietPlayerScreen(activity: ComponentActivity) {
                                     }
                                 }
                             }
-                        },
-                        modifier = Modifier.size(32.dp)
-                    ) {
-                        Icon(
-                            imageVector = if (isPlaying) Icons.Default.Pause else Icons.Default.PlayArrow,
-                            contentDescription = "Старт/Пауза",
-                            tint = Color.White
-                        )
-                    }
+                        }
+                    )
 
-                    IconButton(
-                        onClick = {
+                    Text(
+                        text = "R",
+                        color = if (repeatEnabled) Color(0xFFFF6B6B) else Color.White,
+                        fontSize = 13.sp,
+                        fontWeight = FontWeight.Bold,
+                        modifier = Modifier.clickable {
                             repeatEnabled = !repeatEnabled
                             controller?.repeatMode = if (repeatEnabled) {
                                 Player.REPEAT_MODE_ONE
@@ -425,30 +405,20 @@ fun QuietPlayerScreen(activity: ComponentActivity) {
                                 Player.REPEAT_MODE_OFF
                             }
                             triggerRedHint(if (repeatEnabled) "Повтор включён" else "Повтор выключен")
-                        },
-                        modifier = Modifier.size(30.dp)
-                    ) {
-                        Icon(
-                            imageVector = Icons.Default.Repeat,
-                            contentDescription = "Повтор",
-                            tint = if (repeatEnabled) Color(0xFFFF6B6B) else Color.White
-                        )
-                    }
+                        }
+                    )
 
-                    IconButton(
-                        onClick = {
+                    Text(
+                        text = "S",
+                        color = if (shuffleEnabled) Color(0xFFFF6B6B) else Color.White,
+                        fontSize = 13.sp,
+                        fontWeight = FontWeight.Bold,
+                        modifier = Modifier.clickable {
                             shuffleEnabled = !shuffleEnabled
                             controller?.shuffleModeEnabled = shuffleEnabled
                             triggerRedHint(if (shuffleEnabled) "Перемешивание включено" else "Перемешивание выключено")
-                        },
-                        modifier = Modifier.size(30.dp)
-                    ) {
-                        Icon(
-                            imageVector = Icons.Default.Shuffle,
-                            contentDescription = "Перемешать",
-                            tint = if (shuffleEnabled) Color(0xFFFF6B6B) else Color.White
-                        )
-                    }
+                        }
+                    )
 
                     HorizontalDivider(
                         modifier = Modifier.weight(1f),
@@ -503,7 +473,7 @@ fun QuietPlayerScreen(activity: ComponentActivity) {
                     }
                 ) {
                     Icon(
-                        imageVector = Icons.Default.FileUpload,
+                        imageVector = Icons.Default.PlayArrow,
                         contentDescription = "Экспорт",
                         tint = Color.White,
                         modifier = Modifier.size(26.dp)
@@ -518,7 +488,7 @@ fun QuietPlayerScreen(activity: ComponentActivity) {
                     }
                 ) {
                     Icon(
-                        imageVector = Icons.Default.FileDownload,
+                        imageVector = Icons.Default.PlayArrow,
                         contentDescription = "Импорт",
                         tint = Color.White,
                         modifier = Modifier.size(26.dp)
@@ -693,7 +663,7 @@ fun QuietPlayerScreen(activity: ComponentActivity) {
                     }
 
                     Text(
-                        text = "Сверхтихая шкала: ${"%.1f".format(sliderVolume)}% (сигнал ${"%.4f".format(sliderToPlayerVolume(sliderVolume))})",
+                        text = "Сверхтихая шкала: ${"%.1f".format(sliderVolume)}% (сигнал ${"%.4f".format(sliderToPlayerVolume(sliderVolume, boostPercent))})",
                         color = Color.White,
                         fontSize = 12.sp
                     )
