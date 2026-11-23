@@ -37,6 +37,7 @@ import androidx.compose.material.icons.filled.Menu
 import androidx.compose.material.icons.filled.PlayArrow
 import androidx.compose.material.icons.filled.Refresh
 import androidx.compose.material.icons.filled.Settings
+import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Button
 import androidx.compose.material3.ButtonDefaults
 import androidx.compose.material3.Card
@@ -64,15 +65,18 @@ import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.core.content.ContextCompat
 import androidx.media3.common.MediaItem
+import androidx.media3.common.PlaybackParameters
 import androidx.media3.common.Player
 import androidx.media3.session.MediaController
 import androidx.media3.session.SessionToken
+import coil.compose.AsyncImage
 import kotlinx.coroutines.delay
 import org.json.JSONArray
 import org.json.JSONObject
@@ -112,7 +116,8 @@ private fun sliderToPlayerVolume(sliderValue: Float, boostPercent: Float): Float
 
 private data class TrackEntry(
     val title: String,
-    val uriString: String
+    val uriString: String,
+    val coverUriString: String? = null
 )
 
 private data class CustomPlaylist(
@@ -138,18 +143,26 @@ fun QuietPlayerScreen(activity: ComponentActivity) {
     var activePlaylistIndex by remember { mutableIntStateOf(0) }
     var newPlaylistName by remember { mutableStateOf("") }
 
+    // 0 = Треки, 1 = Плэйлисты, 2 = Открытый трек
+    var activeTab by remember { mutableIntStateOf(0) }
     var playlistMode by remember { mutableStateOf(prefs.getBoolean("playlist_mode", false)) }
     var currentIndex by remember { mutableIntStateOf(0) }
     var isPlaying by remember { mutableStateOf(false) }
 
     var sliderVolume by remember { mutableFloatStateOf(prefs.getFloat("slider_volume", 15f)) }
     var boostPercent by remember { mutableFloatStateOf(prefs.getFloat("boost_percent", 0f)) }
+    var playbackSpeed by remember { mutableFloatStateOf(prefs.getFloat("playback_speed", 1.0f)) }
 
     var sleepSecondsRemaining by remember { mutableStateOf<Int?>(null) }
 
     var showSettings by remember { mutableStateOf(false) }
-    var repeatEnabled by remember { mutableStateOf(false) }
+    var loopModeLabel by remember { mutableStateOf("Без цикла") }
+    var repeatModeState by remember { mutableIntStateOf(Player.REPEAT_MODE_OFF) }
     var shuffleEnabled by remember { mutableStateOf(false) }
+
+    var renameTargetIndex by remember { mutableStateOf<Int?>(null) }
+    var renameDraftText by remember { mutableStateOf("") }
+    var coverTargetIndex by remember { mutableStateOf<Int?>(null) }
 
     var showOnboardingHints by remember {
         mutableStateOf(!prefs.getBoolean("onboarding_shown", false))
@@ -171,8 +184,9 @@ fun QuietPlayerScreen(activity: ComponentActivity) {
         redHintTick++
     }
 
-    fun applyVolumeAndBoost(volSlider: Float, boost: Float) {
+    fun applyPlaybackTuning(volSlider: Float, boost: Float, speed: Float) {
         controller?.volume = sliderToPlayerVolume(volSlider, boost)
+        controller?.playbackParameters = PlaybackParameters(speed.coerceIn(0.25f, 2.0f), 1.0f)
     }
 
     fun persistLists() {
@@ -181,6 +195,73 @@ fun QuietPlayerScreen(activity: ComponentActivity) {
             .putString("saved_playlists", savePlaylistsToJson(playlists))
             .putBoolean("playlist_mode", playlistMode)
             .apply()
+    }
+
+    fun syncQueueWithController(tracks: List<TrackEntry>, startIdx: Int, autoPlay: Boolean) {
+        if (tracks.isEmpty()) return
+        val safeIdx = startIdx.coerceIn(0, tracks.lastIndex)
+        currentIndex = safeIdx
+        controller?.apply {
+            setMediaItems(tracks.map { MediaItem.fromUri(Uri.parse(it.uriString)) }, safeIdx, 0L)
+            prepare()
+            if (autoPlay) play()
+        }
+        if (autoPlay) {
+            isPlaying = true
+            applyPlaybackTuning(sliderVolume, boostPercent, playbackSpeed)
+        }
+    }
+
+    fun replaceCurrentSourceTracks(newTracks: List<TrackEntry>, keepCurrentTrack: Boolean = true) {
+        val currentTitle = displayedTracks.getOrNull(currentIndex)?.title
+        if (playlistMode && playlists.isNotEmpty()) {
+            val plIdx = activePlaylistIndex.coerceIn(0, playlists.lastIndex)
+            playlists = playlists.toMutableList().also {
+                it[plIdx] = it[plIdx].copy(tracks = newTracks)
+            }
+        } else {
+            phoneTracks = newTracks
+        }
+        persistLists()
+
+        val nextIdx = if (keepCurrentTrack && currentTitle != null) {
+            newTracks.indexOfFirst { it.title == currentTitle }.coerceAtLeast(0)
+        } else {
+            0
+        }
+        syncQueueWithController(newTracks, nextIdx, isPlaying)
+    }
+
+    fun updateTrackInCurrentSource(index: Int, transform: (TrackEntry) -> TrackEntry) {
+        if (index < 0) return
+        if (playlistMode && playlists.isNotEmpty()) {
+            val plIdx = activePlaylistIndex.coerceIn(0, playlists.lastIndex)
+            val pl = playlists[plIdx]
+            if (index in pl.tracks.indices) {
+                val updatedTracks = pl.tracks.toMutableList().also { it[index] = transform(it[index]) }
+                playlists = playlists.toMutableList().also { it[plIdx] = pl.copy(tracks = updatedTracks) }
+                persistLists()
+            }
+        } else if (index in phoneTracks.indices) {
+            phoneTracks = phoneTracks.toMutableList().also { it[index] = transform(it[index]) }
+            persistLists()
+        }
+    }
+
+    fun skipToNextTrack() {
+        if (displayedTracks.isEmpty()) return
+        val nextIdx = if (currentIndex + 1 < displayedTracks.size) currentIndex + 1 else 0
+        syncQueueWithController(displayedTracks, nextIdx, true)
+        triggerRedHint("Следующая: ${displayedTracks[nextIdx].title}")
+    }
+
+    fun reviewCurrentTrack() {
+        if (displayedTracks.isEmpty()) return
+        controller?.seekTo(currentIndex, 0L)
+        controller?.play()
+        isPlaying = true
+        applyPlaybackTuning(sliderVolume, boostPercent, playbackSpeed)
+        triggerRedHint("Пересмотр с начала: ${displayedTracks.getOrNull(currentIndex)?.title ?: "Трек"}")
     }
 
     LaunchedEffect(sleepSecondsRemaining) {
@@ -216,6 +297,7 @@ fun QuietPlayerScreen(activity: ComponentActivity) {
             val mc = future.get()
             controller = mc
             mc.volume = sliderToPlayerVolume(sliderVolume, boostPercent)
+            mc.playbackParameters = PlaybackParameters(playbackSpeed.coerceIn(0.25f, 2.0f), 1.0f)
             if (displayedTracks.isNotEmpty()) {
                 mc.setMediaItems(displayedTracks.map { MediaItem.fromUri(Uri.parse(it.uriString)) }, 0, 0L)
                 mc.prepare()
@@ -240,7 +322,7 @@ fun QuietPlayerScreen(activity: ComponentActivity) {
                 } catch (_: Exception) {
                 }
                 val title = uri.lastPathSegment?.substringAfterLast('/') ?: "Трек ${idx + 1}"
-                TrackEntry(title = title, uriString = uri.toString())
+                TrackEntry(title = title, uriString = uri.toString(), coverUriString = null)
             }
 
             if (playlistMode && playlists.isNotEmpty()) {
@@ -252,30 +334,36 @@ fun QuietPlayerScreen(activity: ComponentActivity) {
 
                 val listNow = updatedPlaylist.tracks
                 val startIdx = (listNow.size - added.size).coerceAtLeast(0)
-                currentIndex = startIdx
-                controller?.apply {
-                    setMediaItems(listNow.map { MediaItem.fromUri(Uri.parse(it.uriString)) }, startIdx, 0L)
-                    prepare()
-                    play()
-                }
-                isPlaying = true
-                applyVolumeAndBoost(sliderVolume, boostPercent)
+                syncQueueWithController(listNow, startIdx, true)
                 triggerRedHint("Добавлено в «${target.name}»: ${added.size}")
             } else {
                 phoneTracks = phoneTracks + added
                 persistLists()
 
                 val startIdx = (phoneTracks.size - added.size).coerceAtLeast(0)
-                currentIndex = startIdx
-                controller?.apply {
-                    setMediaItems(phoneTracks.map { MediaItem.fromUri(Uri.parse(it.uriString)) }, startIdx, 0L)
-                    prepare()
-                    play()
-                }
-                isPlaying = true
-                applyVolumeAndBoost(sliderVolume, boostPercent)
+                syncQueueWithController(phoneTracks, startIdx, true)
                 triggerRedHint("Добавлено файлов телефона: ${added.size}")
             }
+        }
+    }
+
+    val pickCoverLauncher = rememberLauncherForActivityResult(
+        contract = ActivityResultContracts.OpenDocument()
+    ) { uri: Uri? ->
+        val targetIdx = coverTargetIndex
+        coverTargetIndex = null
+        if (uri != null && targetIdx != null) {
+            try {
+                activity.contentResolver.takePersistableUriPermission(
+                    uri,
+                    Intent.FLAG_GRANT_READ_URI_PERMISSION
+                )
+            } catch (_: Exception) {
+            }
+            updateTrackInCurrentSource(targetIdx) { old ->
+                old.copy(coverUriString = uri.toString())
+            }
+            triggerRedHint("Ава обновлена")
         }
     }
 
@@ -303,6 +391,7 @@ fun QuietPlayerScreen(activity: ComponentActivity) {
                     playlists = playlists + importedPlaylists
                     activePlaylistIndex = playlists.lastIndex
                     playlistMode = true
+                    activeTab = 1
                     persistLists()
                     triggerRedHint("Импортировано плэйлистов: ${importedPlaylists.size}")
                 } else {
@@ -312,6 +401,7 @@ fun QuietPlayerScreen(activity: ComponentActivity) {
                         playlists = playlists + importedList
                         activePlaylistIndex = playlists.lastIndex
                         playlistMode = true
+                        activeTab = 1
                         persistLists()
                         triggerRedHint("Импортирован плэйлист (${importedTracks.size} треков)")
                     } else {
@@ -322,8 +412,45 @@ fun QuietPlayerScreen(activity: ComponentActivity) {
         }
     }
 
-    val currentTrackTitle = displayedTracks.getOrNull(currentIndex)?.title ?: "MP3"
+    val currentTrack = displayedTracks.getOrNull(currentIndex)
+    val currentTrackTitle = currentTrack?.title ?: "MP3"
     val badgeLetter = currentTrackTitle.firstOrNull { it.isLetterOrDigit() }?.uppercaseChar()?.toString() ?: "♪"
+
+    if (renameTargetIndex != null) {
+        val idxToRename = renameTargetIndex!!
+        AlertDialog(
+            onDismissRequest = { renameTargetIndex = null },
+            title = { Text("Переименовать трек", color = Color.White, fontSize = 15.sp) },
+            text = {
+                OutlinedTextField(
+                    value = renameDraftText,
+                    onValueChange = { renameDraftText = it },
+                    singleLine = true,
+                    placeholder = { Text("Новое название...") }
+                )
+            },
+            confirmButton = {
+                TextButton(
+                    onClick = {
+                        val clean = renameDraftText.trim()
+                        if (clean.isNotEmpty()) {
+                            updateTrackInCurrentSource(idxToRename) { it.copy(title = clean) }
+                            triggerRedHint("Переименовано в «$clean»")
+                        }
+                        renameTargetIndex = null
+                    }
+                ) {
+                    Text("Сохранить", color = Color.White)
+                }
+            },
+            dismissButton = {
+                TextButton(onClick = { renameTargetIndex = null }) {
+                    Text("Отмена", color = Color.White.copy(alpha = 0.7f))
+                }
+            },
+            containerColor = Color(0xFF1A1A20)
+        )
+    }
 
     Column(
         modifier = Modifier
@@ -332,6 +459,7 @@ fun QuietPlayerScreen(activity: ComponentActivity) {
             .padding(14.dp),
         verticalArrangement = Arrangement.spacedBy(10.dp)
     ) {
+        // Верхний блок плеера: ава, пересмотр (<<), старт/пауза, пропуск (>>), скорость
         Row(
             modifier = Modifier
                 .fillMaxWidth()
@@ -343,15 +471,29 @@ fun QuietPlayerScreen(activity: ComponentActivity) {
             Box(
                 modifier = Modifier
                     .size(56.dp)
-                    .background(Color.White, RoundedCornerShape(4.dp)),
+                    .background(Color.White, RoundedCornerShape(4.dp))
+                    .clickable {
+                        if (currentTrack != null) {
+                            activeTab = 2
+                        }
+                    },
                 contentAlignment = Alignment.Center
             ) {
-                Text(
-                    text = badgeLetter,
-                    color = Color.Black,
-                    fontSize = 24.sp,
-                    fontWeight = FontWeight.Bold
-                )
+                if (currentTrack?.coverUriString != null) {
+                    AsyncImage(
+                        model = currentTrack.coverUriString,
+                        contentDescription = "Ава трека",
+                        contentScale = ContentScale.Crop,
+                        modifier = Modifier.fillMaxSize()
+                    )
+                } else {
+                    Text(
+                        text = badgeLetter,
+                        color = Color.Black,
+                        fontSize = 24.sp,
+                        fontWeight = FontWeight.Bold
+                    )
+                }
             }
 
             Column(modifier = Modifier.weight(1f)) {
@@ -360,13 +502,26 @@ fun QuietPlayerScreen(activity: ComponentActivity) {
                     color = Color.White,
                     fontSize = 13.sp,
                     maxLines = 1,
-                    overflow = TextOverflow.Ellipsis
+                    overflow = TextOverflow.Ellipsis,
+                    modifier = Modifier.clickable {
+                        if (currentTrack != null) {
+                            activeTab = 2
+                        }
+                    }
                 )
                 Spacer(modifier = Modifier.height(6.dp))
                 Row(
                     verticalAlignment = Alignment.CenterVertically,
-                    horizontalArrangement = Arrangement.spacedBy(8.dp)
+                    horizontalArrangement = Arrangement.spacedBy(10.dp)
                 ) {
+                    Text(
+                        text = "<<",
+                        color = Color.White,
+                        fontSize = 13.sp,
+                        fontWeight = FontWeight.Bold,
+                        modifier = Modifier.clickable { reviewCurrentTrack() }
+                    )
+
                     Text(
                         text = if (isPlaying) "||" else ">",
                         color = Color.White,
@@ -384,7 +539,7 @@ fun QuietPlayerScreen(activity: ComponentActivity) {
                                     } else {
                                         it.play()
                                         isPlaying = true
-                                        applyVolumeAndBoost(sliderVolume, boostPercent)
+                                        applyPlaybackTuning(sliderVolume, boostPercent, playbackSpeed)
                                         triggerRedHint("Воспроизведение")
                                     }
                                 }
@@ -393,31 +548,19 @@ fun QuietPlayerScreen(activity: ComponentActivity) {
                     )
 
                     Text(
-                        text = "R",
-                        color = if (repeatEnabled) Color(0xFFFF6B6B) else Color.White,
+                        text = ">>",
+                        color = Color.White,
                         fontSize = 13.sp,
                         fontWeight = FontWeight.Bold,
-                        modifier = Modifier.clickable {
-                            repeatEnabled = !repeatEnabled
-                            controller?.repeatMode = if (repeatEnabled) {
-                                Player.REPEAT_MODE_ONE
-                            } else {
-                                Player.REPEAT_MODE_OFF
-                            }
-                            triggerRedHint(if (repeatEnabled) "Повтор включён" else "Повтор выключен")
-                        }
+                        modifier = Modifier.clickable { skipToNextTrack() }
                     )
 
                     Text(
-                        text = "S",
-                        color = if (shuffleEnabled) Color(0xFFFF6B6B) else Color.White,
-                        fontSize = 13.sp,
+                        text = "${"%.2f".format(playbackSpeed)}x",
+                        color = if (playbackSpeed != 1.0f) Color(0xFFFF7878) else Color.White,
+                        fontSize = 12.sp,
                         fontWeight = FontWeight.Bold,
-                        modifier = Modifier.clickable {
-                            shuffleEnabled = !shuffleEnabled
-                            controller?.shuffleModeEnabled = shuffleEnabled
-                            triggerRedHint(if (shuffleEnabled) "Перемешивание включено" else "Перемешивание выключено")
-                        }
+                        modifier = Modifier.clickable { activeTab = 2 }
                     )
 
                     HorizontalDivider(
@@ -444,6 +587,7 @@ fun QuietPlayerScreen(activity: ComponentActivity) {
             }
         }
 
+        // Строка НАЗАД слева и ЭКСПОРТ / ИМПОРТ / НАСТРОЙКИ справа
         Row(
             modifier = Modifier.fillMaxWidth(),
             horizontalArrangement = Arrangement.SpaceBetween,
@@ -452,8 +596,12 @@ fun QuietPlayerScreen(activity: ComponentActivity) {
             Column(
                 horizontalAlignment = Alignment.CenterHorizontally,
                 modifier = Modifier.clickable {
-                    showSettings = false
-                    triggerRedHint("Возврат к списку")
+                    if (activeTab == 2) {
+                        activeTab = if (playlistMode) 1 else 0
+                    } else {
+                        showSettings = false
+                    }
+                    triggerRedHint("Назад")
                 }
             ) {
                 Icon(
@@ -514,6 +662,36 @@ fun QuietPlayerScreen(activity: ComponentActivity) {
             }
         }
 
+        // Отдельные вкладки
+        Row(
+            modifier = Modifier.fillMaxWidth(),
+            horizontalArrangement = Arrangement.spacedBy(8.dp)
+        ) {
+            FilterChip(
+                selected = activeTab == 0,
+                onClick = {
+                    activeTab = 0
+                    playlistMode = false
+                    persistLists()
+                },
+                label = { Text("Треки", fontSize = 12.sp) }
+            )
+            FilterChip(
+                selected = activeTab == 1,
+                onClick = {
+                    activeTab = 1
+                    playlistMode = true
+                    persistLists()
+                },
+                label = { Text("Плэйлисты", fontSize = 12.sp) }
+            )
+            FilterChip(
+                selected = activeTab == 2,
+                onClick = { activeTab = 2 },
+                label = { Text("Трек и скорость", fontSize = 12.sp) }
+            )
+        }
+
         redHintText?.let { msg ->
             Box(
                 modifier = Modifier
@@ -548,7 +726,7 @@ fun QuietPlayerScreen(activity: ComponentActivity) {
                         fontSize = 13.sp
                     )
                     Text(
-                        text = "• Нажми три полоски вверху справа, чтобы переключиться между файлами телефона и плэйлистами, создать свой плэйлист или поставить таймер сна.\n• Нажми «+ Добавить MP3», чтобы выбрать файлы с телефона.",
+                        text = "• Используй вкладки «Треки», «Плэйлисты» и «Трек и скорость».\n• В настройках плэйлиста есть зацикливание трека/списка, случайный и обратный порядок, создание плэйлистов и таймер сна.",
                         color = Color.White.copy(alpha = 0.9f),
                         fontSize = 12.sp
                     )
@@ -562,6 +740,7 @@ fun QuietPlayerScreen(activity: ComponentActivity) {
             }
         }
 
+        // Настройки плэйлиста / очереди (как на скриншоте) + создание плэйлистов + таймер сна
         if (showSettings) {
             Card(
                 colors = CardDefaults.cardColors(containerColor = Color(0xFF17171C)),
@@ -569,40 +748,60 @@ fun QuietPlayerScreen(activity: ComponentActivity) {
             ) {
                 Column(
                     modifier = Modifier.padding(12.dp),
-                    verticalArrangement = Arrangement.spacedBy(10.dp)
+                    verticalArrangement = Arrangement.spacedBy(8.dp)
                 ) {
-                    Text("Настройки плеера", color = Color.White, fontWeight = FontWeight.Bold, fontSize = 14.sp)
+                    Text("Настройки плэйлиста ($loopModeLabel)", color = Color.White, fontWeight = FontWeight.Bold, fontSize = 14.sp)
 
-                    Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                        FilterChip(
-                            selected = !playlistMode,
-                            onClick = {
-                                playlistMode = false
-                                currentIndex = 0
-                                persistLists()
-                                if (phoneTracks.isNotEmpty()) {
-                                    controller?.setMediaItems(phoneTracks.map { MediaItem.fromUri(Uri.parse(it.uriString)) }, 0, 0L)
-                                    controller?.prepare()
-                                }
-                                triggerRedHint("Источник: Файлы телефона")
-                            },
-                            label = { Text("Файлы телефона", fontSize = 12.sp) }
-                        )
-                        FilterChip(
-                            selected = playlistMode,
-                            onClick = {
-                                playlistMode = true
-                                currentIndex = 0
-                                persistLists()
-                                val listNow = playlists.getOrNull(activePlaylistIndex)?.tracks ?: emptyList()
-                                if (listNow.isNotEmpty()) {
-                                    controller?.setMediaItems(listNow.map { MediaItem.fromUri(Uri.parse(it.uriString)) }, 0, 0L)
-                                    controller?.prepare()
-                                }
-                                triggerRedHint("Источник: Плэйлисты")
-                            },
-                            label = { Text("Плэйлисты", fontSize = 12.sp) }
-                        )
+                    OutlinedButton(
+                        onClick = {
+                            repeatModeState = Player.REPEAT_MODE_ONE
+                            loopModeLabel = "Зациклить трек"
+                            controller?.repeatMode = Player.REPEAT_MODE_ONE
+                            triggerRedHint("Зациклить трек")
+                        },
+                        modifier = Modifier.fillMaxWidth()
+                    ) {
+                        Text("Зациклить трек", color = Color.White, fontSize = 12.sp)
+                    }
+
+                    OutlinedButton(
+                        onClick = {
+                            repeatModeState = Player.REPEAT_MODE_ALL
+                            loopModeLabel = "Зациклить список"
+                            controller?.repeatMode = Player.REPEAT_MODE_ALL
+                            triggerRedHint("Зациклить список")
+                        },
+                        modifier = Modifier.fillMaxWidth()
+                    ) {
+                        Text("Зациклить список", color = Color.White, fontSize = 12.sp)
+                    }
+
+                    OutlinedButton(
+                        onClick = {
+                            shuffleEnabled = true
+                            controller?.shuffleModeEnabled = true
+                            if (displayedTracks.size > 1) {
+                                replaceCurrentSourceTracks(displayedTracks.shuffled(), keepCurrentTrack = false)
+                            }
+                            triggerRedHint("Случайный порядок применён")
+                        },
+                        modifier = Modifier.fillMaxWidth()
+                    ) {
+                        Text("Случайный порядок", color = Color.White, fontSize = 12.sp)
+                    }
+
+                    OutlinedButton(
+                        onClick = {
+                            shuffleEnabled = false
+                            controller?.shuffleModeEnabled = false
+                            if (displayedTracks.size > 1) {
+                                replaceCurrentSourceTracks(displayedTracks.reversed(), keepCurrentTrack = false)
+                            }
+                            triggerRedHint("Обратный порядок применён")
+                        },
+                        modifier = Modifier.fillMaxWidth()
+                    ) {
+                        Text("Обратный порядок", color = Color.White, fontSize = 12.sp)
                     }
 
                     Row(
@@ -623,6 +822,7 @@ fun QuietPlayerScreen(activity: ComponentActivity) {
                                 playlists = playlists + CustomPlaylist(name = cleanName, tracks = emptyList())
                                 activePlaylistIndex = playlists.lastIndex
                                 playlistMode = true
+                                activeTab = 1
                                 newPlaylistName = ""
                                 persistLists()
                                 triggerRedHint("Создан плэйлист «$cleanName»")
@@ -662,36 +862,6 @@ fun QuietPlayerScreen(activity: ComponentActivity) {
                         }
                     }
 
-                    Text(
-                        text = "Сверхтихая шкала: ${"%.1f".format(sliderVolume)}% (сигнал ${"%.4f".format(sliderToPlayerVolume(sliderVolume, boostPercent))})",
-                        color = Color.White,
-                        fontSize = 12.sp
-                    )
-                    Slider(
-                        value = sliderVolume,
-                        onValueChange = {
-                            sliderVolume = it
-                            prefs.edit().putFloat("slider_volume", it).apply()
-                            applyVolumeAndBoost(sliderVolume, boostPercent)
-                        },
-                        valueRange = 0f..100f
-                    )
-
-                    Text(
-                        text = "Лёгкий буст для тихих треков: +${boostPercent.toInt()}%",
-                        color = Color.White,
-                        fontSize = 12.sp
-                    )
-                    Slider(
-                        value = boostPercent,
-                        onValueChange = {
-                            boostPercent = it
-                            prefs.edit().putFloat("boost_percent", it).apply()
-                            applyVolumeAndBoost(sliderVolume, boostPercent)
-                        },
-                        valueRange = 0f..100f
-                    )
-
                     OutlinedButton(
                         onClick = {
                             showOnboardingHints = true
@@ -706,121 +876,337 @@ fun QuietPlayerScreen(activity: ComponentActivity) {
             }
         }
 
-        Row(
-            modifier = Modifier.fillMaxWidth(),
-            horizontalArrangement = Arrangement.SpaceBetween,
-            verticalAlignment = Alignment.CenterVertically
-        ) {
-            val headerText = if (playlistMode) {
-                val activeName = playlists.getOrNull(activePlaylistIndex)?.name ?: "Нет плэйлистов"
-                "ПЛЭЙЛИСТ: $activeName"
-            } else {
-                "ФАЙЛЫ ТЕЛЕФОНА"
-            }
-            Text(
-                text = headerText,
-                color = Color.White,
-                fontWeight = FontWeight.Bold,
-                fontSize = 14.sp,
-                maxLines = 1,
-                overflow = TextOverflow.Ellipsis,
-                modifier = Modifier.weight(1f)
-            )
-            Button(
-                onClick = {
-                    if (playlistMode && playlists.isEmpty()) {
-                        val defaultList = CustomPlaylist("Мой плэйлист", emptyList())
-                        playlists = listOf(defaultList)
-                        activePlaylistIndex = 0
-                        persistLists()
-                    }
-                    pickAudioLauncher.launch(arrayOf("audio/*"))
-                },
-                colors = ButtonDefaults.buttonColors(
-                    containerColor = Color.White,
-                    contentColor = Color.Black
-                )
-            ) {
-                Text("+ Добавить MP3", fontSize = 12.sp, fontWeight = FontWeight.Bold)
-            }
-        }
-
-        if (playlistMode && playlists.size > 1) {
-            Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                playlists.forEachIndexed { idx, pl ->
-                    FilterChip(
-                        selected = idx == activePlaylistIndex,
-                        onClick = {
-                            activePlaylistIndex = idx
-                            currentIndex = 0
-                            if (pl.tracks.isNotEmpty()) {
-                                controller?.setMediaItems(pl.tracks.map { MediaItem.fromUri(Uri.parse(it.uriString)) }, 0, 0L)
-                                controller?.prepare()
-                            }
-                            triggerRedHint("Выбран плэйлист «${pl.name}»")
-                        },
-                        label = { Text(pl.name, fontSize = 12.sp) }
-                    )
-                }
-            }
-        }
-
-        if (displayedTracks.isEmpty()) {
-            Box(
-                modifier = Modifier
-                    .weight(1f)
-                    .fillMaxWidth()
-                    .border(BorderStroke(1.dp, Color.White.copy(alpha = 0.25f)), RoundedCornerShape(8.dp))
-                    .padding(16.dp),
-                contentAlignment = Alignment.Center
-            ) {
-                Text(
-                    text = if (playlistMode) {
-                        "Плэйлист пуст — создай его в настройках или добавь MP3 сверху"
-                    } else {
-                        "Здесь появятся MP3-файлы с телефона"
-                    },
-                    color = Color.White.copy(alpha = 0.75f),
-                    fontSize = 15.sp
-                )
-            }
-        } else {
+        // ВКЛАДКА 2: Открытый трек — крупная ава + точные настройки и замедление
+        if (activeTab == 2) {
             LazyColumn(
                 modifier = Modifier.weight(1f),
-                verticalArrangement = Arrangement.spacedBy(8.dp)
+                verticalArrangement = Arrangement.spacedBy(12.dp)
             ) {
-                itemsIndexed(displayedTracks) { index, item ->
-                    val selected = index == currentIndex
+                item {
                     Card(
-                        colors = CardDefaults.cardColors(
-                            containerColor = if (selected) Color(0xFF282832) else Color(0xFF16161A)
-                        ),
-                        border = if (selected) BorderStroke(1.dp, Color.White) else null,
-                        onClick = {
-                            currentIndex = index
-                            controller?.apply {
-                                setMediaItems(displayedTracks.map { MediaItem.fromUri(Uri.parse(it.uriString)) }, index, 0L)
-                                prepare()
-                                play()
-                            }
-                            isPlaying = true
-                            applyVolumeAndBoost(sliderVolume, boostPercent)
-                            triggerRedHint("Играет: ${item.title}")
-                        },
+                        colors = CardDefaults.cardColors(containerColor = Color(0xFF17171C)),
                         modifier = Modifier.fillMaxWidth()
                     ) {
-                        Text(
-                            text = "${index + 1}. ${item.title}",
-                            color = Color.White,
-                            maxLines = 1,
-                            overflow = TextOverflow.Ellipsis,
-                            modifier = Modifier.padding(12.dp)
+                        Column(
+                            modifier = Modifier.padding(14.dp),
+                            horizontalAlignment = Alignment.CenterHorizontally,
+                            verticalArrangement = Arrangement.spacedBy(10.dp)
+                        ) {
+                            Box(
+                                modifier = Modifier
+                                    .size(210.dp)
+                                    .background(Color(0xFF24242C), RoundedCornerShape(12.dp))
+                                    .border(BorderStroke(1.dp, Color.White.copy(alpha = 0.35f)), RoundedCornerShape(12.dp)),
+                                contentAlignment = Alignment.Center
+                            ) {
+                                if (currentTrack?.coverUriString != null) {
+                                    AsyncImage(
+                                        model = currentTrack.coverUriString,
+                                        contentDescription = "Большая ава трека",
+                                        contentScale = ContentScale.Crop,
+                                        modifier = Modifier.fillMaxSize()
+                                    )
+                                } else {
+                                    Text(
+                                        text = badgeLetter,
+                                        color = Color.White,
+                                        fontSize = 64.sp,
+                                        fontWeight = FontWeight.Bold
+                                    )
+                                }
+                            }
+
+                            Text(
+                                text = currentTrackTitle,
+                                color = Color.White,
+                                fontSize = 16.sp,
+                                fontWeight = FontWeight.Bold,
+                                maxLines = 2,
+                                overflow = TextOverflow.Ellipsis
+                            )
+
+                            Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                                OutlinedButton(onClick = { reviewCurrentTrack() }) {
+                                    Text("Пересмотр (<<)", color = Color.White, fontSize = 12.sp)
+                                }
+                                OutlinedButton(onClick = { skipToNextTrack() }) {
+                                    Text("Далее (>>)", color = Color.White, fontSize = 12.sp)
+                                }
+                            }
+
+                            Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                                OutlinedButton(
+                                    onClick = {
+                                        if (currentTrack != null) {
+                                            coverTargetIndex = currentIndex
+                                            pickCoverLauncher.launch(arrayOf("image/*"))
+                                        }
+                                    }
+                                ) {
+                                    Text("Сменить аву", color = Color.White, fontSize = 12.sp)
+                                }
+                                OutlinedButton(
+                                    onClick = {
+                                        if (currentTrack != null) {
+                                            renameDraftText = currentTrack.title
+                                            renameTargetIndex = currentIndex
+                                        }
+                                    }
+                                ) {
+                                    Text("Переименовать", color = Color.White, fontSize = 12.sp)
+                                }
+                            }
+                        }
+                    }
+                }
+
+                item {
+                    Card(
+                        colors = CardDefaults.cardColors(containerColor = Color(0xFF17171C)),
+                        modifier = Modifier.fillMaxWidth()
+                    ) {
+                        Column(
+                            modifier = Modifier.padding(12.dp),
+                            verticalArrangement = Arrangement.spacedBy(10.dp)
+                        ) {
+                            Text(
+                                text = "Точные настройки: скорость / замедление и звук",
+                                color = Color.White,
+                                fontWeight = FontWeight.Bold,
+                                fontSize = 14.sp
+                            )
+
+                            Text(
+                                text = "Скорость воспроизведения: ${"%.2f".format(playbackSpeed)}x",
+                                color = Color.White,
+                                fontSize = 12.sp
+                            )
+                            Slider(
+                                value = playbackSpeed,
+                                onValueChange = { newSpeed ->
+                                    playbackSpeed = (kotlin.math.round(newSpeed * 20f) / 20f).coerceIn(0.25f, 2.0f)
+                                    prefs.edit().putFloat("playback_speed", playbackSpeed).apply()
+                                    applyPlaybackTuning(sliderVolume, boostPercent, playbackSpeed)
+                                },
+                                valueRange = 0.25f..2.0f
+                            )
+
+                            Row(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+                                listOf(0.5f, 0.75f, 1.0f, 1.25f).forEach { presetSpeed ->
+                                    FilterChip(
+                                        selected = kotlin.math.abs(playbackSpeed - presetSpeed) < 0.02f,
+                                        onClick = {
+                                            playbackSpeed = presetSpeed
+                                            prefs.edit().putFloat("playback_speed", playbackSpeed).apply()
+                                            applyPlaybackTuning(sliderVolume, boostPercent, playbackSpeed)
+                                            triggerRedHint("Скорость: ${presetSpeed}x")
+                                        },
+                                        label = { Text("${presetSpeed}x", fontSize = 11.sp) }
+                                    )
+                                }
+                            }
+
+                            Text(
+                                text = "Сверхтихая шкала: ${"%.1f".format(sliderVolume)}% (сигнал ${"%.4f".format(sliderToPlayerVolume(sliderVolume, boostPercent))})",
+                                color = Color.White,
+                                fontSize = 12.sp
+                            )
+                            Slider(
+                                value = sliderVolume,
+                                onValueChange = {
+                                    sliderVolume = it
+                                    prefs.edit().putFloat("slider_volume", it).apply()
+                                    applyPlaybackTuning(sliderVolume, boostPercent, playbackSpeed)
+                                },
+                                valueRange = 0f..100f
+                            )
+
+                            Text(
+                                text = "Лёгкий буст для тихих треков: +${boostPercent.toInt()}%",
+                                color = Color.White,
+                                fontSize = 12.sp
+                            )
+                            Slider(
+                                value = boostPercent,
+                                onValueChange = {
+                                    boostPercent = it
+                                    prefs.edit().putFloat("boost_percent", it).apply()
+                                    applyPlaybackTuning(sliderVolume, boostPercent, playbackSpeed)
+                                },
+                                valueRange = 0f..100f
+                            )
+                        }
+                    }
+                }
+            }
+        } else {
+            // ВКЛАДКИ 0 и 1: Треки / Плэйлисты (без нумерации)
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.SpaceBetween,
+                verticalAlignment = Alignment.CenterVertically
+            ) {
+                val headerText = if (activeTab == 1) {
+                    val activeName = playlists.getOrNull(activePlaylistIndex)?.name ?: "Нет плэйлистов"
+                    "ПЛЭЙЛИСТ: $activeName"
+                } else {
+                    "ФАЙЛЫ ТЕЛЕФОНА"
+                }
+                Text(
+                    text = headerText,
+                    color = Color.White,
+                    fontWeight = FontWeight.Bold,
+                    fontSize = 14.sp,
+                    maxLines = 1,
+                    overflow = TextOverflow.Ellipsis,
+                    modifier = Modifier.weight(1f)
+                )
+                Button(
+                    onClick = {
+                        if (activeTab == 1 && playlists.isEmpty()) {
+                            val defaultList = CustomPlaylist("Мой плэйлист", emptyList())
+                            playlists = listOf(defaultList)
+                            activePlaylistIndex = 0
+                            persistLists()
+                        }
+                        pickAudioLauncher.launch(arrayOf("audio/*"))
+                    },
+                    colors = ButtonDefaults.buttonColors(
+                        containerColor = Color.White,
+                        contentColor = Color.Black
+                    )
+                ) {
+                    Text("+ Добавить MP3", fontSize = 12.sp, fontWeight = FontWeight.Bold)
+                }
+            }
+
+            if (activeTab == 1 && playlists.size > 1) {
+                Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                    playlists.forEachIndexed { idx, pl ->
+                        FilterChip(
+                            selected = idx == activePlaylistIndex,
+                            onClick = {
+                                activePlaylistIndex = idx
+                                currentIndex = 0
+                                if (pl.tracks.isNotEmpty()) {
+                                    syncQueueWithController(pl.tracks, 0, false)
+                                }
+                                triggerRedHint("Выбран плэйлист «${pl.name}»")
+                            },
+                            label = { Text(pl.name, fontSize = 12.sp) }
                         )
                     }
                 }
             }
+
+            if (displayedTracks.isEmpty()) {
+                Box(
+                    modifier = Modifier
+                        .weight(1f)
+                        .fillMaxWidth()
+                        .border(BorderStroke(1.dp, Color.White.copy(alpha = 0.25f)), RoundedCornerShape(8.dp))
+                        .padding(16.dp),
+                    contentAlignment = Alignment.Center
+                ) {
+                    Text(
+                        text = if (activeTab == 1) {
+                            "Плэйлист пуст — создай его в настройках или добавь MP3 сверху"
+                        } else {
+                            "Здесь появятся MP3-файлы с телефона"
+                        },
+                        color = Color.White.copy(alpha = 0.75f),
+                        fontSize = 15.sp
+                    )
+                }
+            } else {
+                LazyColumn(
+                    modifier = Modifier.weight(1f),
+                    verticalArrangement = Arrangement.spacedBy(8.dp)
+                ) {
+                    itemsIndexed(displayedTracks) { index, item ->
+                        val selected = index == currentIndex
+                        val itemBadge = item.title.firstOrNull { it.isLetterOrDigit() }?.uppercaseChar()?.toString() ?: "♪"
+                        Card(
+                            colors = CardDefaults.cardColors(
+                                containerColor = if (selected) Color(0xFF282832) else Color(0xFF16161A)
+                            ),
+                            border = if (selected) BorderStroke(1.dp, Color.White) else null,
+                            onClick = {
+                                syncQueueWithController(displayedTracks, index, true)
+                                activeTab = 2
+                                triggerRedHint("Открыт: ${item.title}")
+                            },
+                            modifier = Modifier.fillMaxWidth()
+                        ) {
+                            Row(
+                                modifier = Modifier
+                                    .fillMaxWidth()
+                                    .padding(10.dp),
+                                verticalAlignment = Alignment.CenterVertically,
+                                horizontalArrangement = Arrangement.spacedBy(10.dp)
+                            ) {
+                                Box(
+                                    modifier = Modifier
+                                        .size(44.dp)
+                                        .background(Color(0xFF2B2B35), RoundedCornerShape(6.dp))
+                                        .clickable {
+                                            coverTargetIndex = index
+                                            pickCoverLauncher.launch(arrayOf("image/*"))
+                                        },
+                                    contentAlignment = Alignment.Center
+                                ) {
+                                    if (item.coverUriString != null) {
+                                        AsyncImage(
+                                            model = item.coverUriString,
+                                            contentDescription = "Ава",
+                                            contentScale = ContentScale.Crop,
+                                            modifier = Modifier.fillMaxSize()
+                                        )
+                                    } else {
+                                        Text(
+                                            text = itemBadge,
+                                            color = Color.White,
+                                            fontSize = 16.sp,
+                                            fontWeight = FontWeight.Bold
+                                        )
+                                    }
+                                }
+
+                                Text(
+                                    text = item.title,
+                                    color = Color.White,
+                                    maxLines = 1,
+                                    overflow = TextOverflow.Ellipsis,
+                                    modifier = Modifier.weight(1f)
+                                )
+
+                                OutlinedButton(
+                                    onClick = {
+                                        renameDraftText = item.title
+                                        renameTargetIndex = index
+                                    },
+                                    contentPadding = PaddingValues(horizontal = 8.dp, vertical = 2.dp)
+                                ) {
+                                    Text("Имя", color = Color.White, fontSize = 11.sp)
+                                }
+
+                                OutlinedButton(
+                                    onClick = {
+                                        coverTargetIndex = index
+                                        pickCoverLauncher.launch(arrayOf("image/*"))
+                                    },
+                                    contentPadding = PaddingValues(horizontal = 8.dp, vertical = 2.dp)
+                                ) {
+                                    Text("Ава", color = Color.White, fontSize = 11.sp)
+                                }
+                            }
+                        }
+                    }
+                }
+            }
         }
 
+        // Нижняя панель переключения вкладок
         Row(
             modifier = Modifier
                 .fillMaxWidth()
@@ -833,6 +1219,7 @@ fun QuietPlayerScreen(activity: ComponentActivity) {
                 horizontalArrangement = Arrangement.spacedBy(10.dp),
                 modifier = Modifier.clickable {
                     playlistMode = !playlistMode
+                    activeTab = if (playlistMode) 1 else 0
                     currentIndex = 0
                     persistLists()
                     triggerRedHint(if (playlistMode) "Режим: Плэйлисты" else "Режим: Файлы телефона")
@@ -854,11 +1241,7 @@ fun QuietPlayerScreen(activity: ComponentActivity) {
                 IconButton(
                     onClick = {
                         triggerRedHint(
-                            if (playlistMode) {
-                                "Подсказка: внизу «P» — плэйлисты, три полоски вверху — настройки"
-                            } else {
-                                "Подсказка: внизу «F» — файлы телефона, три полоски вверху — настройки"
-                            }
+                            "Вкладки: «Треки», «Плэйлисты» и «Трек и скорость»"
                         )
                     },
                     modifier = Modifier.size(32.dp)
@@ -880,6 +1263,9 @@ private fun saveTracksToJson(tracks: List<TrackEntry>): String {
         val obj = JSONObject()
         obj.put("title", item.title)
         obj.put("uri", item.uriString)
+        if (item.coverUriString != null) {
+            obj.put("cover", item.coverUriString)
+        }
         arr.put(obj)
     }
     return arr.toString()
@@ -893,8 +1279,15 @@ private fun loadTracksFromJson(jsonStr: String): List<TrackEntry> {
             val obj = arr.getJSONObject(i)
             val title = obj.optString("title", "")
             val uri = obj.optString("uri", "")
+            val cover = obj.optString("cover", "").takeIf { it.isNotBlank() }
             if (uri.isNotBlank()) {
-                result.add(TrackEntry(title = title.ifBlank { "Трек ${i + 1}" }, uriString = uri))
+                result.add(
+                    TrackEntry(
+                        title = title.ifBlank { "Трек ${i + 1}" },
+                        uriString = uri,
+                        coverUriString = cover
+                    )
+                )
             }
         }
         result
