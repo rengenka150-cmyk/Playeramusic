@@ -1,9 +1,12 @@
 package com.example.quietplayer
 
 import android.content.Context
+import android.content.Intent
 import android.content.SharedPreferences
+import android.content.res.Configuration
 import android.net.Uri
 import android.os.Bundle
+import android.provider.OpenableColumns
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.compose.setContent
@@ -26,7 +29,11 @@ import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.filled.Add
 import androidx.compose.material.icons.filled.Close
+import androidx.compose.material.icons.filled.Delete
+import androidx.compose.material.icons.filled.FileDownload
+import androidx.compose.material.icons.filled.FileUpload
 import androidx.compose.material.icons.filled.MoreVert
 import androidx.compose.material.icons.filled.Pause
 import androidx.compose.material.icons.filled.PlayArrow
@@ -69,6 +76,7 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.layout.ContentScale
+import androidx.compose.ui.platform.LocalConfiguration
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
@@ -82,6 +90,7 @@ import coil.compose.AsyncImage
 import kotlinx.coroutines.delay
 import org.json.JSONArray
 import org.json.JSONObject
+import java.util.UUID
 
 enum class AppThemeMode {
     DARK, LIGHT, SYSTEM
@@ -125,6 +134,10 @@ class MainActivity : ComponentActivity() {
 @Composable
 private fun QuietPlayerRoot() {
     val context = LocalContext.current
+    val configuration = LocalConfiguration.current
+    val systemDark = (configuration.uiMode and Configuration.UI_MODE_NIGHT_MASK) == Configuration.UI_MODE_NIGHT_YEAR_MASK ||
+        (configuration.uiMode and Configuration.UI_MODE_NIGHT_MASK) == Configuration.UI_MODE_NIGHT_YES
+
     val prefs = remember {
         context.getSharedPreferences("quiet_player_prefs", Context.MODE_PRIVATE)
     }
@@ -144,7 +157,7 @@ private fun QuietPlayerRoot() {
     val activeScheme = when (themeMode) {
         AppThemeMode.DARK -> QuietDarkScheme
         AppThemeMode.LIGHT -> QuietLightScheme
-        AppThemeMode.SYSTEM -> QuietDarkScheme
+        AppThemeMode.SYSTEM -> if (systemDark) QuietDarkScheme else QuietLightScheme
     }
 
     MaterialTheme(colorScheme = activeScheme) {
@@ -170,7 +183,13 @@ private fun QuietPlayerScreen(
         }
     }
 
-    fun persistTracks() {
+    val customPlaylists = remember {
+        mutableStateListOf<String>().apply {
+            addAll(loadPlaylistsFromPrefs(prefs))
+        }
+    }
+
+    fun persistAll() {
         val arr = JSONArray()
         tracks.forEach { item ->
             arr.put(
@@ -183,22 +202,29 @@ private fun QuietPlayerScreen(
                 }
             )
         }
-        prefs.edit().putString("tracks_json", arr.toString()).apply()
+        val plArr = JSONArray()
+        customPlaylists.forEach { plArr.put(it) }
+
+        prefs.edit()
+            .putString("tracks_json", arr.toString())
+            .putString("playlists_json", plArr.toString())
+            .apply()
     }
 
-    var selectedTab by remember { mutableIntStateOf(0) }
+    var selectedTab by remember { mutableIntStateOf(0) } // 0 = Tracks, 1 = Playlists & Theme
     var selectedPlaylist by remember { mutableStateOf("All") }
     var activeTrackId by remember { mutableStateOf<String?>(null) }
     var sheetOpened by remember { mutableStateOf(false) }
 
     var isPlaying by remember { mutableStateOf(false) }
-    var playbackSpeed by remember { mutableFloatStateOf(1.0f) }
+    var playbackSpeed by remember { mutableFloatStateOf(1.25f) }
     var positionMs by remember { mutableLongStateOf(0L) }
     var durationMs by remember { mutableLongStateOf(0L) }
 
     var renameTargetId by remember { mutableStateOf<String?>(null) }
     var renameText by remember { mutableStateOf("") }
     var avatarTargetId by remember { mutableStateOf<String?>(null) }
+    var newPlaylistName by remember { mutableStateOf("") }
 
     val player = remember {
         ExoPlayer.Builder(context).build().apply {
@@ -213,20 +239,6 @@ private fun QuietPlayerScreen(
     }
 
     val activeTrack = tracks.firstOrNull { it.id == activeTrackId }
-
-    val avatarPicker = rememberLauncherForActivityResult(
-        contract = ActivityResultContracts.GetContent()
-    ) { uri: Uri? ->
-        val targetId = avatarTargetId
-        if (uri != null && targetId != null) {
-            val idx = tracks.indexOfFirst { it.id == targetId }
-            if (idx >= 0) {
-                tracks[idx] = tracks[idx].copy(avatarUri = uri.toString())
-                persistTracks()
-            }
-        }
-        avatarTargetId = null
-    }
 
     fun playTrack(track: TrackItem) {
         activeTrackId = track.id
@@ -247,11 +259,102 @@ private fun QuietPlayerScreen(
         durationMs = 0L
     }
 
+    fun deleteTrack(trackId: String) {
+        if (activeTrackId == trackId) {
+            stopAndClearSelection()
+        }
+        tracks.removeAll { it.id == trackId }
+        persistAll()
+    }
+
     fun stepTrack(delta: Int) {
         if (tracks.isEmpty() || activeTrackId == null) return
         val currentIdx = tracks.indexOfFirst { it.id == activeTrackId }.coerceAtLeast(0)
         val nextIdx = (currentIdx + delta + tracks.size) % tracks.size
         playTrack(tracks[nextIdx])
+    }
+
+    val audioPicker = rememberLauncherForActivityResult(
+        contract = ActivityResultContracts.OpenMultipleDocuments()
+    ) { uris: List<Uri> ->
+        if (uris.isNotEmpty()) {
+            val targetPlaylist = if (selectedPlaylist == "All") "Default" else selectedPlaylist
+            uris.forEach { uri ->
+                runCatching {
+                    context.contentResolver.takePersistableUriPermission(
+                        uri,
+                        Intent.FLAG_GRANT_READ_URI_PERMISSION
+                    )
+                }
+                val displayName = queryDisplayName(context, uri)
+                    ?.substringBeforeLast('.')
+                    ?.ifBlank { null }
+                    ?: "Track ${tracks.size + 1}"
+
+                tracks.add(
+                    TrackItem(
+                        id = UUID.randomUUID().toString(),
+                        title = displayName,
+                        uriString = uri.toString(),
+                        avatarUri = null,
+                        playlist = targetPlaylist
+                    )
+                )
+            }
+            persistAll()
+        }
+    }
+
+    val avatarPicker = rememberLauncherForActivityResult(
+        contract = ActivityResultContracts.GetContent()
+    ) { uri: Uri? ->
+        val targetId = avatarTargetId
+        if (uri != null && targetId != null) {
+            runCatching {
+                context.contentResolver.takePersistableUriPermission(
+                    uri,
+                    Intent.FLAG_GRANT_READ_URI_PERMISSION
+                )
+            }
+            val idx = tracks.indexOfFirst { it.id == targetId }
+            if (idx >= 0) {
+                tracks[idx] = tracks[idx].copy(avatarUri = uri.toString())
+                persistAll()
+            }
+        }
+        avatarTargetId = null
+    }
+
+    val exportLauncher = rememberLauncherForActivityResult(
+        contract = ActivityResultContracts.CreateDocument("application/json")
+    ) { uri: Uri? ->
+        if (uri != null) {
+            runCatching {
+                val payload = buildBackupJson(tracks, customPlaylists, themeMode)
+                context.contentResolver.openOutputStream(uri)?.use { out ->
+                    out.write(payload.toByteArray(Charsets.UTF_8))
+                }
+            }
+        }
+    }
+
+    val importLauncher = rememberLauncherForActivityResult(
+        contract = ActivityResultContracts.OpenDocument()
+    ) { uri: Uri? ->
+        if (uri != null) {
+            runCatching {
+                val content = context.contentResolver.openInputStream(uri)?.use { input ->
+                    input.readBytes().toString(Charsets.UTF_8)
+                } ?: return@runCatching
+                applyBackupJson(
+                    rawJson = content,
+                    tracks = tracks,
+                    customPlaylists = customPlaylists,
+                    onThemeLoaded = onThemeChange
+                )
+                persistAll()
+            }
+        }
     }
 
     LaunchedEffect(player) {
@@ -289,36 +392,75 @@ private fun QuietPlayerScreen(
         Column(
             modifier = Modifier
                 .fillMaxSize()
-                .padding(bottom = if (activeTrack != null) 82.dp else 8.dp)
+                .padding(bottom = if (activeTrack != null && !sheetOpened) 84.dp else 8.dp)
         ) {
+            // Верхняя панель иконок: вкладки + экспорт/импорт + добавление аудио
             Row(
                 modifier = Modifier
                     .fillMaxWidth()
-                    .padding(horizontal = 16.dp, vertical = 10.dp),
-                horizontalArrangement = Arrangement.SpaceEvenly,
+                    .padding(horizontal = 12.dp, vertical = 10.dp),
+                horizontalArrangement = Arrangement.SpaceBetween,
                 verticalAlignment = Alignment.CenterVertically
             ) {
-                IconButton(onClick = { selectedTab = 0 }) {
-                    Icon(
-                        imageVector = Icons.Outlined.LibraryMusic,
-                        contentDescription = null,
-                        tint = if (selectedTab == 0) {
-                            MaterialTheme.colorScheme.primary
-                        } else {
-                            MaterialTheme.colorScheme.onSurface.copy(alpha = 0.6f)
-                        }
-                    )
+                Row(
+                    horizontalArrangement = Arrangement.spacedBy(8.dp),
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    IconButton(onClick = { selectedTab = 0 }) {
+                        Icon(
+                            imageVector = Icons.Outlined.LibraryMusic,
+                            contentDescription = null,
+                            tint = if (selectedTab == 0) {
+                                MaterialTheme.colorScheme.primary
+                            } else {
+                                MaterialTheme.colorScheme.onSurface.copy(alpha = 0.6f)
+                            }
+                        )
+                    }
+                    IconButton(onClick = { selectedTab = 1 }) {
+                        Icon(
+                            imageVector = Icons.Default.QueueMusic,
+                            contentDescription = null,
+                            tint = if (selectedTab == 1) {
+                                MaterialTheme.colorScheme.primary
+                            } else {
+                                MaterialTheme.colorScheme.onSurface.copy(alpha = 0.6f)
+                            }
+                        )
+                    }
                 }
-                IconButton(onClick = { selectedTab = 1 }) {
-                    Icon(
-                        imageVector = Icons.Default.QueueMusic,
-                        contentDescription = null,
-                        tint = if (selectedTab == 1) {
-                            MaterialTheme.colorScheme.primary
-                        } else {
-                            MaterialTheme.colorScheme.onSurface.copy(alpha = 0.6f)
-                        }
-                    )
+
+                Row(
+                    horizontalArrangement = Arrangement.spacedBy(4.dp),
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    IconButton(
+                        onClick = { audioPicker.launch(arrayOf("audio/*")) }
+                    ) {
+                        Icon(
+                            imageVector = Icons.Default.Add,
+                            contentDescription = null,
+                            tint = MaterialTheme.colorScheme.onSurface
+                        )
+                    }
+                    IconButton(
+                        onClick = { exportLauncher.launch("quietplayer_backup.json") }
+                    ) {
+                        Icon(
+                            imageVector = Icons.Default.FileUpload,
+                            contentDescription = null,
+                            tint = MaterialTheme.colorScheme.onSurface
+                        )
+                    }
+                    IconButton(
+                        onClick = { importLauncher.launch(arrayOf("application/json", "text/*", "*/*")) }
+                    ) {
+                        Icon(
+                            imageVector = Icons.Default.FileDownload,
+                            contentDescription = null,
+                            tint = MaterialTheme.colorScheme.onSurface
+                        )
+                    }
                 }
             }
 
@@ -347,6 +489,17 @@ private fun QuietPlayerScreen(
                                 onClick = {
                                     playTrack(track)
                                     sheetOpened = true
+                                },
+                                onRename = {
+                                    renameTargetId = track.id
+                                    renameText = track.title
+                                },
+                                onChangeAvatar = {
+                                    avatarTargetId = track.id
+                                    avatarPicker.launch("image/*")
+                                },
+                                onDelete = {
+                                    deleteTrack(track.id)
                                 }
                             )
                         }
@@ -357,10 +510,36 @@ private fun QuietPlayerScreen(
                     modifier = Modifier
                         .fillMaxSize()
                         .padding(horizontal = 16.dp, vertical = 8.dp),
-                    verticalArrangement = Arrangement.spacedBy(12.dp)
+                    verticalArrangement = Arrangement.spacedBy(14.dp)
                 ) {
-                    val playlists = remember(tracks.toList()) {
-                        listOf("All") + tracks.map { it.playlist }.distinct()
+                    val playlists = remember(tracks.toList(), customPlaylists.toList()) {
+                        (listOf("All", "Default") + customPlaylists + tracks.map { it.playlist }).distinct()
+                    }
+
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        horizontalArrangement = Arrangement.spacedBy(8.dp),
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        OutlinedTextField(
+                            value = newPlaylistName,
+                            onValueChange = { newPlaylistName = it },
+                            modifier = Modifier.weight(1f),
+                            singleLine = true
+                        )
+                        IconButton(
+                            onClick = {
+                                val name = newPlaylistName.trim()
+                                if (name.isNotEmpty() && name !in playlists) {
+                                    customPlaylists.add(name)
+                                    selectedPlaylist = name
+                                    newPlaylistName = ""
+                                    persistAll()
+                                }
+                            }
+                        ) {
+                            Icon(Icons.Default.Add, contentDescription = null)
+                        }
                     }
 
                     Row(
@@ -390,6 +569,7 @@ private fun QuietPlayerScreen(
             }
         }
 
+        // Нижняя плашка выбранного трека — только пока выбран трек
         if (activeTrack != null && !sheetOpened) {
             Surface(
                 modifier = Modifier
@@ -437,6 +617,13 @@ private fun QuietPlayerScreen(
                     IconButton(onClick = { stepTrack(1) }) {
                         Icon(Icons.Default.SkipNext, contentDescription = null)
                     }
+                    Text(
+                        text = "${playbackSpeed}x",
+                        fontSize = 12.sp,
+                        fontWeight = FontWeight.Medium,
+                        color = MaterialTheme.colorScheme.primary,
+                        modifier = Modifier.padding(horizontal = 4.dp)
+                    )
                     IconButton(onClick = { stopAndClearSelection() }) {
                         Icon(Icons.Default.Close, contentDescription = null)
                     }
@@ -444,6 +631,7 @@ private fun QuietPlayerScreen(
             }
         }
 
+        // Выезжающая шторка поверх затемнённого главного экрана
         if (sheetOpened && activeTrack != null) {
             Box(
                 modifier = Modifier
@@ -503,6 +691,16 @@ private fun QuietPlayerScreen(
                                         renameText = activeTrack.title
                                     }
                                 )
+                                DropdownMenuItem(
+                                    text = { Text("Delete") },
+                                    leadingIcon = {
+                                        Icon(Icons.Default.Delete, contentDescription = null)
+                                    },
+                                    onClick = {
+                                        menuExpanded = false
+                                        deleteTrack(activeTrack.id)
+                                    }
+                                )
                             }
                         }
                     }
@@ -512,7 +710,7 @@ private fun QuietPlayerScreen(
                     TrackAvatarBox(
                         title = activeTrack.title,
                         avatarUri = activeTrack.avatarUri,
-                        sizeDp = 190
+                        sizeDp = 196
                     )
 
                     Spacer(modifier = Modifier.height(14.dp))
@@ -528,6 +726,7 @@ private fun QuietPlayerScreen(
 
                     Spacer(modifier = Modifier.height(16.dp))
 
+                    // Ползунок перемотки с минутами и секундами на фоне самой шторки, выше кнопок
                     val safeDuration = durationMs.coerceAtLeast(1L)
                     Row(
                         modifier = Modifier.fillMaxWidth(),
@@ -563,6 +762,7 @@ private fun QuietPlayerScreen(
 
                     Spacer(modifier = Modifier.height(8.dp))
 
+                    // Все кнопки управления ниже ползунка
                     Row(
                         modifier = Modifier.fillMaxWidth(),
                         horizontalArrangement = Arrangement.SpaceEvenly,
@@ -650,7 +850,7 @@ private fun QuietPlayerScreen(
                                 val idx = tracks.indexOfFirst { it.id == targetId }
                                 if (idx >= 0) {
                                     tracks[idx] = tracks[idx].copy(title = cleanName)
-                                    persistTracks()
+                                    persistAll()
                                 }
                             }
                             renameTargetId = null
@@ -673,8 +873,13 @@ private fun QuietPlayerScreen(
 private fun TrackRowCard(
     track: TrackItem,
     isSelected: Boolean,
-    onClick: () -> Unit
+    onClick: () -> Unit,
+    onRename: () -> Unit,
+    onChangeAvatar: () -> Unit,
+    onDelete: () -> Unit
 ) {
+    var rowMenuExpanded by remember { mutableStateOf(false) }
+
     Card(
         modifier = Modifier
             .fillMaxWidth()
@@ -691,7 +896,7 @@ private fun TrackRowCard(
         Row(
             modifier = Modifier
                 .fillMaxWidth()
-                .padding(horizontal = 12.dp, vertical = 10.dp),
+                .padding(start = 12.dp, end = 4.dp, top = 8.dp, bottom = 8.dp),
             verticalAlignment = Alignment.CenterVertically
         ) {
             TrackAvatarBox(
@@ -702,11 +907,46 @@ private fun TrackRowCard(
             Spacer(modifier = Modifier.width(12.dp))
             Text(
                 text = track.title,
+                modifier = Modifier.weight(1f),
                 maxLines = 1,
                 overflow = TextOverflow.Ellipsis,
                 fontWeight = if (isSelected) FontWeight.SemiBold else FontWeight.Normal,
                 color = MaterialTheme.colorScheme.onSurface
             )
+            Box {
+                IconButton(onClick = { rowMenuExpanded = true }) {
+                    Icon(Icons.Default.MoreVert, contentDescription = null)
+                }
+                DropdownMenu(
+                    expanded = rowMenuExpanded,
+                    onDismissRequest = { rowMenuExpanded = false }
+                ) {
+                    DropdownMenuItem(
+                        text = { Text("Avatar") },
+                        onClick = {
+                            rowMenuExpanded = false
+                            onChangeAvatar()
+                        }
+                    )
+                    DropdownMenuItem(
+                        text = { Text("Rename") },
+                        onClick = {
+                            rowMenuExpanded = false
+                            onRename()
+                        }
+                    )
+                    DropdownMenuItem(
+                        text = { Text("Delete") },
+                        leadingIcon = {
+                            Icon(Icons.Default.Delete, contentDescription = null)
+                        },
+                        onClick = {
+                            rowMenuExpanded = false
+                            onDelete()
+                        }
+                    )
+                }
+            }
         }
     }
 }
@@ -751,6 +991,94 @@ private fun formatMmSs(ms: Long): String {
     return "%02d:%02d".format(mins, secs)
 }
 
+private fun queryDisplayName(context: Context, uri: Uri): String? {
+    return runCatching {
+        context.contentResolver.query(
+            uri,
+            arrayOf(OpenableColumns.DISPLAY_NAME),
+            null,
+            null,
+            null
+        )?.use { cursor ->
+            if (cursor.moveToFirst()) {
+                val idx = cursor.getColumnIndex(OpenableColumns.DISPLAY_NAME)
+                if (idx >= 0) cursor.getString(idx) else null
+            } else {
+                null
+            }
+        }
+    }.getOrNull()
+}
+
+private fun buildBackupJson(
+    tracks: List<TrackItem>,
+    playlists: List<String>,
+    themeMode: AppThemeMode
+): String {
+    val trackArr = JSONArray()
+    tracks.forEach { item ->
+        trackArr.put(
+            JSONObject().apply {
+                put("id", item.id)
+                put("title", item.title)
+                put("uri", item.uriString)
+                put("avatar", item.avatarUri ?: "")
+                put("playlist", item.playlist)
+            }
+        )
+    }
+    val plArr = JSONArray()
+    playlists.forEach { plArr.put(it) }
+
+    return JSONObject().apply {
+        put("theme", themeMode.name)
+        put("playlists", plArr)
+        put("tracks", trackArr)
+    }.toString(2)
+}
+
+private fun applyBackupJson(
+    rawJson: String,
+    tracks: MutableList<TrackItem>,
+    customPlaylists: MutableList<String>,
+    onThemeLoaded: (AppThemeMode) -> Unit
+) {
+    val root = JSONObject(rawJson)
+    val themeName = root.optString("theme", AppThemeMode.DARK.name)
+    runCatching { AppThemeMode.valueOf(themeName) }.getOrNull()?.let(onThemeLoaded)
+
+    val plArr = root.optJSONArray("playlists")
+    if (plArr != null) {
+        customPlaylists.clear()
+        for (i in 0 until plArr.length()) {
+            val name = plArr.optString(i).trim()
+            if (name.isNotEmpty() && name != "All" && name != "Default" && name !in customPlaylists) {
+                customPlaylists.add(name)
+            }
+        }
+    }
+
+    val trackArr = root.optJSONArray("tracks")
+    if (trackArr != null) {
+        tracks.clear()
+        for (i in 0 until trackArr.length()) {
+            val obj = trackArr.getJSONObject(i)
+            val uriStr = obj.optString("uri")
+            if (uriStr.isNotBlank()) {
+                tracks.add(
+                    TrackItem(
+                        id = obj.optString("id").ifBlank { UUID.randomUUID().toString() },
+                        title = obj.optString("title").ifBlank { "Track ${i + 1}" },
+                        uriString = uriStr,
+                        avatarUri = obj.optString("avatar").ifBlank { null },
+                        playlist = obj.optString("playlist", "Default").ifBlank { "Default" }
+                    )
+                )
+            }
+        }
+    }
+}
+
 private fun loadTracksFromPrefs(prefs: SharedPreferences): List<TrackItem> {
     val raw = prefs.getString("tracks_json", null) ?: return emptyList()
     return runCatching {
@@ -767,6 +1095,19 @@ private fun loadTracksFromPrefs(prefs: SharedPreferences): List<TrackItem> {
                         playlist = obj.optString("playlist", "Default")
                     )
                 )
+            }
+        }
+    }.getOrDefault(emptyList())
+}
+
+private fun loadPlaylistsFromPrefs(prefs: SharedPreferences): List<String> {
+    val raw = prefs.getString("playlists_json", null) ?: return emptyList()
+    return runCatching {
+        val arr = JSONArray(raw)
+        buildList {
+            for (i in 0 until arr.length()) {
+                val name = arr.optString(i).trim()
+                if (name.isNotEmpty()) add(name)
             }
         }
     }.getOrDefault(emptyList())
