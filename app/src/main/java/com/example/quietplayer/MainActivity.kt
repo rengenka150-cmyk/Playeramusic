@@ -1,6 +1,7 @@
 package com.example.quietplayer
 
 import android.content.Context
+import android.content.SharedPreferences
 import android.net.Uri
 import android.os.Bundle
 import androidx.activity.ComponentActivity
@@ -53,6 +54,7 @@ import androidx.compose.material3.TextButton
 import androidx.compose.material3.darkColorScheme
 import androidx.compose.material3.lightColorScheme
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableFloatStateOf
@@ -123,11 +125,15 @@ class MainActivity : ComponentActivity() {
 @Composable
 private fun QuietPlayerRoot() {
     val context = LocalContext.current
-    val prefs = remember { context.getSharedPreferences("quiet_player_prefs", Context.MODE_PRIVATE) }
+    val prefs = remember {
+        context.getSharedPreferences("quiet_player_prefs", Context.MODE_PRIVATE)
+    }
 
     var themeMode by remember {
         val savedMode = prefs.getString("theme_mode", AppThemeMode.DARK.name) ?: AppThemeMode.DARK.name
-        mutableStateOf(runCatching { AppThemeMode.valueOf(savedMode) }.getOrDefault(AppThemeMode.DARK))
+        mutableStateOf(
+            runCatching { AppThemeMode.valueOf(savedMode) }.getOrDefault(AppThemeMode.DARK)
+        )
     }
 
     fun updateTheme(mode: AppThemeMode) {
@@ -154,7 +160,7 @@ private fun QuietPlayerRoot() {
 private fun QuietPlayerScreen(
     themeMode: AppThemeMode,
     onThemeChange: (AppThemeMode) -> Unit,
-    prefs: android.content.SharedPreferences
+    prefs: SharedPreferences
 ) {
     val context = LocalContext.current
 
@@ -180,7 +186,7 @@ private fun QuietPlayerScreen(
         prefs.edit().putString("tracks_json", arr.toString()).apply()
     }
 
-    var selectedTab by remember { mutableIntStateOf(0) } // 0 = Tracks, 1 = Playlists
+    var selectedTab by remember { mutableIntStateOf(0) }
     var selectedPlaylist by remember { mutableStateOf("All") }
     var activeTrackId by remember { mutableStateOf<String?>(null) }
     var sheetOpened by remember { mutableStateOf(false) }
@@ -197,6 +203,12 @@ private fun QuietPlayerScreen(
     val player = remember {
         ExoPlayer.Builder(context).build().apply {
             repeatMode = Player.REPEAT_MODE_OFF
+        }
+    }
+
+    DisposableEffect(player) {
+        onDispose {
+            player.release()
         }
     }
 
@@ -279,7 +291,6 @@ private fun QuietPlayerScreen(
                 .fillMaxSize()
                 .padding(bottom = if (activeTrack != null) 82.dp else 8.dp)
         ) {
-            // Верхняя панель вкладок — только иконки без подписей
             Row(
                 modifier = Modifier
                     .fillMaxWidth()
@@ -291,14 +302,22 @@ private fun QuietPlayerScreen(
                     Icon(
                         imageVector = Icons.Outlined.LibraryMusic,
                         contentDescription = null,
-                        tint = if (selectedTab == 0) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.onSurface.copy(alpha = 0.6f)
+                        tint = if (selectedTab == 0) {
+                            MaterialTheme.colorScheme.primary
+                        } else {
+                            MaterialTheme.colorScheme.onSurface.copy(alpha = 0.6f)
+                        }
                     )
                 }
                 IconButton(onClick = { selectedTab = 1 }) {
                     Icon(
                         imageVector = Icons.Default.QueueMusic,
                         contentDescription = null,
-                        tint = if (selectedTab == 1) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.onSurface.copy(alpha = 0.6f)
+                        tint = if (selectedTab == 1) {
+                            MaterialTheme.colorScheme.primary
+                        } else {
+                            MaterialTheme.colorScheme.onSurface.copy(alpha = 0.6f)
+                        }
                     )
                 }
             }
@@ -334,7 +353,6 @@ private fun QuietPlayerScreen(
                     }
                 }
             } else {
-                // Вкладка плейлистов и выбор темы
                 Column(
                     modifier = Modifier
                         .fillMaxSize()
@@ -372,7 +390,6 @@ private fun QuietPlayerScreen(
             }
         }
 
-        // Нижняя плашка выбранного трека — только пока выбран трек
         if (activeTrack != null && !sheetOpened) {
             Surface(
                 modifier = Modifier
@@ -427,7 +444,6 @@ private fun QuietPlayerScreen(
             }
         }
 
-        // Выезжающая шторка поверх затемнённого главного экрана
         if (sheetOpened && activeTrack != null) {
             Box(
                 modifier = Modifier
@@ -453,7 +469,6 @@ private fun QuietPlayerScreen(
                         .padding(horizontal = 20.dp, vertical = 14.dp),
                     horizontalAlignment = Alignment.CenterHorizontally
                 ) {
-                    // Верхняя полоска и три точки в правом верхнем углу
                     Box(modifier = Modifier.fillMaxWidth()) {
                         Box(
                             modifier = Modifier
@@ -494,7 +509,6 @@ private fun QuietPlayerScreen(
 
                     Spacer(modifier = Modifier.height(6.dp))
 
-                    // Крупная аватарка
                     TrackAvatarBox(
                         title = activeTrack.title,
                         avatarUri = activeTrack.avatarUri,
@@ -514,7 +528,6 @@ private fun QuietPlayerScreen(
 
                     Spacer(modifier = Modifier.height(16.dp))
 
-                    // Ползунок перемотки с минутами и секундами на фоне самой шторки, выше кнопок
                     val safeDuration = durationMs.coerceAtLeast(1L)
                     Row(
                         modifier = Modifier.fillMaxWidth(),
@@ -550,7 +563,6 @@ private fun QuietPlayerScreen(
 
                     Spacer(modifier = Modifier.height(8.dp))
 
-                    // Все кнопки управления ниже ползунка
                     Row(
                         modifier = Modifier.fillMaxWidth(),
                         horizontalArrangement = Arrangement.SpaceEvenly,
@@ -560,4 +572,202 @@ private fun QuietPlayerScreen(
                             Icon(
                                 imageVector = Icons.Default.SkipPrevious,
                                 contentDescription = null,
-                                modifier = Modifier.
+                                modifier = Modifier.size(30.dp)
+                            )
+                        }
+
+                        IconButton(
+                            onClick = {
+                                if (isPlaying) player.pause() else player.play()
+                            },
+                            modifier = Modifier.size(56.dp)
+                        ) {
+                            Icon(
+                                imageVector = if (isPlaying) Icons.Default.Pause else Icons.Default.PlayArrow,
+                                contentDescription = null,
+                                modifier = Modifier.size(36.dp)
+                            )
+                        }
+
+                        IconButton(onClick = { stepTrack(1) }) {
+                            Icon(
+                                imageVector = Icons.Default.SkipNext,
+                                contentDescription = null,
+                                modifier = Modifier.size(30.dp)
+                            )
+                        }
+
+                        IconButton(onClick = { stopAndClearSelection() }) {
+                            Icon(
+                                imageVector = Icons.Default.Close,
+                                contentDescription = null,
+                                modifier = Modifier.size(26.dp)
+                            )
+                        }
+                    }
+
+                    Spacer(modifier = Modifier.height(8.dp))
+
+                    val speeds = listOf(0.75f, 1.0f, 1.25f)
+                    Row(
+                        horizontalArrangement = Arrangement.spacedBy(8.dp),
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        speeds.forEach { spd ->
+                            FilterChip(
+                                selected = playbackSpeed == spd,
+                                onClick = {
+                                    playbackSpeed = spd
+                                    player.playbackParameters = PlaybackParameters(spd)
+                                },
+                                label = { Text("${spd}x") }
+                            )
+                        }
+                    }
+
+                    Spacer(modifier = Modifier.height(10.dp))
+                }
+            }
+        }
+
+        if (renameTargetId != null) {
+            AlertDialog(
+                onDismissRequest = { renameTargetId = null },
+                title = { Text("Rename") },
+                text = {
+                    OutlinedTextField(
+                        value = renameText,
+                        onValueChange = { renameText = it },
+                        singleLine = true
+                    )
+                },
+                confirmButton = {
+                    Button(
+                        onClick = {
+                            val targetId = renameTargetId
+                            val cleanName = renameText.trim()
+                            if (targetId != null && cleanName.isNotEmpty()) {
+                                val idx = tracks.indexOfFirst { it.id == targetId }
+                                if (idx >= 0) {
+                                    tracks[idx] = tracks[idx].copy(title = cleanName)
+                                    persistTracks()
+                                }
+                            }
+                            renameTargetId = null
+                        }
+                    ) {
+                        Text("OK")
+                    }
+                },
+                dismissButton = {
+                    TextButton(onClick = { renameTargetId = null }) {
+                        Text("Cancel")
+                    }
+                }
+            )
+        }
+    }
+}
+
+@Composable
+private fun TrackRowCard(
+    track: TrackItem,
+    isSelected: Boolean,
+    onClick: () -> Unit
+) {
+    Card(
+        modifier = Modifier
+            .fillMaxWidth()
+            .clickable(onClick = onClick),
+        shape = RoundedCornerShape(14.dp),
+        colors = CardDefaults.cardColors(
+            containerColor = if (isSelected) {
+                MaterialTheme.colorScheme.surface.copy(alpha = 0.9f)
+            } else {
+                MaterialTheme.colorScheme.surface
+            }
+        )
+    ) {
+        Row(
+            modifier = Modifier
+                .fillMaxWidth()
+                .padding(horizontal = 12.dp, vertical = 10.dp),
+            verticalAlignment = Alignment.CenterVertically
+        ) {
+            TrackAvatarBox(
+                title = track.title,
+                avatarUri = track.avatarUri,
+                sizeDp = 42
+            )
+            Spacer(modifier = Modifier.width(12.dp))
+            Text(
+                text = track.title,
+                maxLines = 1,
+                overflow = TextOverflow.Ellipsis,
+                fontWeight = if (isSelected) FontWeight.SemiBold else FontWeight.Normal,
+                color = MaterialTheme.colorScheme.onSurface
+            )
+        }
+    }
+}
+
+@Composable
+private fun TrackAvatarBox(
+    title: String,
+    avatarUri: String?,
+    sizeDp: Int
+) {
+    val initial = title.trim().firstOrNull()?.uppercaseChar()?.toString() ?: "♪"
+    Box(
+        modifier = Modifier
+            .size(sizeDp.dp)
+            .clip(RoundedCornerShape(12.dp))
+            .background(MaterialTheme.colorScheme.onSurface.copy(alpha = 0.12f)),
+        contentAlignment = Alignment.Center
+    ) {
+        if (!avatarUri.isNullOrBlank()) {
+            AsyncImage(
+                model = avatarUri,
+                contentDescription = null,
+                contentScale = ContentScale.Crop,
+                modifier = Modifier.fillMaxSize()
+            )
+        } else {
+            Text(
+                text = initial,
+                fontSize = (sizeDp / 2.5f).sp,
+                fontWeight = FontWeight.Bold,
+                color = MaterialTheme.colorScheme.onSurface.copy(alpha = 0.85f)
+            )
+        }
+    }
+}
+
+private fun formatMmSs(ms: Long): String {
+    val safeMs = ms.coerceAtLeast(0L)
+    val totalSec = safeMs / 1000L
+    val mins = totalSec / 60L
+    val secs = totalSec % 60L
+    return "%02d:%02d".format(mins, secs)
+}
+
+private fun loadTracksFromPrefs(prefs: SharedPreferences): List<TrackItem> {
+    val raw = prefs.getString("tracks_json", null) ?: return emptyList()
+    return runCatching {
+        val arr = JSONArray(raw)
+        buildList {
+            for (i in 0 until arr.length()) {
+                val obj = arr.getJSONObject(i)
+                add(
+                    TrackItem(
+                        id = obj.optString("id"),
+                        title = obj.optString("title"),
+                        uriString = obj.optString("uri"),
+                        avatarUri = obj.optString("avatar").ifBlank { null },
+                        playlist = obj.optString("playlist", "Default")
+                    )
+                )
+            }
+        }
+    }.getOrDefault(emptyList())
+}
