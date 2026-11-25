@@ -3,7 +3,6 @@ package com.example.quietplayer
 import android.content.Context
 import android.content.Intent
 import android.content.SharedPreferences
-import android.content.res.Configuration
 import android.net.Uri
 import android.os.Bundle
 import android.provider.OpenableColumns
@@ -59,7 +58,6 @@ import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.material3.darkColorScheme
-import androidx.compose.material3.lightColorScheme
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
@@ -76,7 +74,6 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.layout.ContentScale
-import androidx.compose.ui.platform.LocalConfiguration
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
@@ -91,10 +88,6 @@ import kotlinx.coroutines.delay
 import org.json.JSONArray
 import org.json.JSONObject
 import java.util.UUID
-
-enum class AppThemeMode {
-    DARK, LIGHT, SYSTEM
-}
 
 data class TrackItem(
     val id: String,
@@ -113,15 +106,6 @@ private val QuietDarkScheme: ColorScheme = darkColorScheme(
     onSurface = Color(0xFFF3F3F6)
 )
 
-private val QuietLightScheme: ColorScheme = lightColorScheme(
-    primary = Color(0xFFD94B4B),
-    background = Color(0xFFF5F5F7),
-    surface = Color(0xFFFFFFFF),
-    onPrimary = Color.White,
-    onBackground = Color(0xFF141418),
-    onSurface = Color(0xFF141418)
-)
-
 class MainActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -134,47 +118,17 @@ class MainActivity : ComponentActivity() {
 @Composable
 private fun QuietPlayerRoot() {
     val context = LocalContext.current
-    val configuration = LocalConfiguration.current
-    val systemDark = (configuration.uiMode and Configuration.UI_MODE_NIGHT_MASK) == Configuration.UI_MODE_NIGHT_YEAR_MASK ||
-        (configuration.uiMode and Configuration.UI_MODE_NIGHT_MASK) == Configuration.UI_MODE_NIGHT_YES
-
     val prefs = remember {
         context.getSharedPreferences("quiet_player_prefs", Context.MODE_PRIVATE)
     }
 
-    var themeMode by remember {
-        val savedMode = prefs.getString("theme_mode", AppThemeMode.DARK.name) ?: AppThemeMode.DARK.name
-        mutableStateOf(
-            runCatching { AppThemeMode.valueOf(savedMode) }.getOrDefault(AppThemeMode.DARK)
-        )
-    }
-
-    fun updateTheme(mode: AppThemeMode) {
-        themeMode = mode
-        prefs.edit().putString("theme_mode", mode.name).apply()
-    }
-
-    val activeScheme = when (themeMode) {
-        AppThemeMode.DARK -> QuietDarkScheme
-        AppThemeMode.LIGHT -> QuietLightScheme
-        AppThemeMode.SYSTEM -> if (systemDark) QuietDarkScheme else QuietLightScheme
-    }
-
-    MaterialTheme(colorScheme = activeScheme) {
-        QuietPlayerScreen(
-            themeMode = themeMode,
-            onThemeChange = ::updateTheme,
-            prefs = prefs
-        )
+    MaterialTheme(colorScheme = QuietDarkScheme) {
+        QuietPlayerScreen(prefs = prefs)
     }
 }
 
 @Composable
-private fun QuietPlayerScreen(
-    themeMode: AppThemeMode,
-    onThemeChange: (AppThemeMode) -> Unit,
-    prefs: SharedPreferences
-) {
+private fun QuietPlayerScreen(prefs: SharedPreferences) {
     val context = LocalContext.current
 
     val tracks = remember {
@@ -211,7 +165,7 @@ private fun QuietPlayerScreen(
             .apply()
     }
 
-    var selectedTab by remember { mutableIntStateOf(0) } // 0 = Tracks, 1 = Playlists & Theme
+    var selectedTab by remember { mutableIntStateOf(0) }
     var selectedPlaylist by remember { mutableStateOf("All") }
     var activeTrackId by remember { mutableStateOf<String?>(null) }
     var sheetOpened by remember { mutableStateOf(false) }
@@ -330,7 +284,7 @@ private fun QuietPlayerScreen(
     ) { uri: Uri? ->
         if (uri != null) {
             runCatching {
-                val payload = buildBackupJson(tracks, customPlaylists, themeMode)
+                val payload = buildBackupJson(tracks, customPlaylists)
                 context.contentResolver.openOutputStream(uri)?.use { out ->
                     out.write(payload.toByteArray(Charsets.UTF_8))
                 }
@@ -349,8 +303,7 @@ private fun QuietPlayerScreen(
                 applyBackupJson(
                     rawJson = content,
                     tracks = tracks,
-                    customPlaylists = customPlaylists,
-                    onThemeLoaded = onThemeChange
+                    customPlaylists = customPlaylists
                 )
                 persistAll()
             }
@@ -394,7 +347,6 @@ private fun QuietPlayerScreen(
                 .fillMaxSize()
                 .padding(bottom = if (activeTrack != null && !sheetOpened) 84.dp else 8.dp)
         ) {
-            // Верхняя панель иконок: вкладки + экспорт/импорт + добавление аудио
             Row(
                 modifier = Modifier
                     .fillMaxWidth()
@@ -434,27 +386,21 @@ private fun QuietPlayerScreen(
                     horizontalArrangement = Arrangement.spacedBy(4.dp),
                     verticalAlignment = Alignment.CenterVertically
                 ) {
-                    IconButton(
-                        onClick = { audioPicker.launch(arrayOf("audio/*")) }
-                    ) {
+                    IconButton(onClick = { audioPicker.launch(arrayOf("audio/*")) }) {
                         Icon(
                             imageVector = Icons.Default.Add,
                             contentDescription = null,
                             tint = MaterialTheme.colorScheme.onSurface
                         )
                     }
-                    IconButton(
-                        onClick = { exportLauncher.launch("quietplayer_backup.json") }
-                    ) {
+                    IconButton(onClick = { exportLauncher.launch("quietplayer_backup.json") }) {
                         Icon(
                             imageVector = Icons.Default.FileUpload,
                             contentDescription = null,
                             tint = MaterialTheme.colorScheme.onSurface
                         )
                     }
-                    IconButton(
-                        onClick = { importLauncher.launch(arrayOf("application/json", "text/*", "*/*")) }
-                    ) {
+                    IconButton(onClick = { importLauncher.launch(arrayOf("application/json", "text/*", "*/*")) }) {
                         Icon(
                             imageVector = Icons.Default.FileDownload,
                             contentDescription = null,
@@ -553,23 +499,10 @@ private fun QuietPlayerScreen(
                             )
                         }
                     }
-
-                    Row(
-                        horizontalArrangement = Arrangement.spacedBy(8.dp)
-                    ) {
-                        AppThemeMode.entries.forEach { mode ->
-                            FilterChip(
-                                selected = themeMode == mode,
-                                onClick = { onThemeChange(mode) },
-                                label = { Text(mode.name) }
-                            )
-                        }
-                    }
                 }
             }
         }
 
-        // Нижняя плашка выбранного трека — только пока выбран трек
         if (activeTrack != null && !sheetOpened) {
             Surface(
                 modifier = Modifier
@@ -578,8 +511,7 @@ private fun QuietPlayerScreen(
                     .padding(8.dp)
                     .clickable { sheetOpened = true },
                 shape = RoundedCornerShape(16.dp),
-                color = MaterialTheme.colorScheme.surface,
-                tonalElevation = 4.dp
+                color = MaterialTheme.colorScheme.surface
             ) {
                 Row(
                     modifier = Modifier
@@ -631,7 +563,6 @@ private fun QuietPlayerScreen(
             }
         }
 
-        // Выезжающая шторка поверх затемнённого главного экрана
         if (sheetOpened && activeTrack != null) {
             Box(
                 modifier = Modifier
@@ -646,8 +577,7 @@ private fun QuietPlayerScreen(
                     .fillMaxWidth()
                     .clickable(enabled = false, onClick = {}),
                 shape = RoundedCornerShape(topStart = 24.dp, topEnd = 24.dp),
-                color = MaterialTheme.colorScheme.surface,
-                tonalElevation = 8.dp
+                color = MaterialTheme.colorScheme.surface
             ) {
                 var menuExpanded by remember { mutableStateOf(false) }
 
@@ -726,7 +656,6 @@ private fun QuietPlayerScreen(
 
                     Spacer(modifier = Modifier.height(16.dp))
 
-                    // Ползунок перемотки с минутами и секундами на фоне самой шторки, выше кнопок
                     val safeDuration = durationMs.coerceAtLeast(1L)
                     Row(
                         modifier = Modifier.fillMaxWidth(),
@@ -762,7 +691,6 @@ private fun QuietPlayerScreen(
 
                     Spacer(modifier = Modifier.height(8.dp))
 
-                    // Все кнопки управления ниже ползунка
                     Row(
                         modifier = Modifier.fillMaxWidth(),
                         horizontalArrangement = Arrangement.SpaceEvenly,
@@ -1012,8 +940,7 @@ private fun queryDisplayName(context: Context, uri: Uri): String? {
 
 private fun buildBackupJson(
     tracks: List<TrackItem>,
-    playlists: List<String>,
-    themeMode: AppThemeMode
+    playlists: List<String>
 ): String {
     val trackArr = JSONArray()
     tracks.forEach { item ->
@@ -1031,7 +958,6 @@ private fun buildBackupJson(
     playlists.forEach { plArr.put(it) }
 
     return JSONObject().apply {
-        put("theme", themeMode.name)
         put("playlists", plArr)
         put("tracks", trackArr)
     }.toString(2)
@@ -1040,12 +966,9 @@ private fun buildBackupJson(
 private fun applyBackupJson(
     rawJson: String,
     tracks: MutableList<TrackItem>,
-    customPlaylists: MutableList<String>,
-    onThemeLoaded: (AppThemeMode) -> Unit
+    customPlaylists: MutableList<String>
 ) {
     val root = JSONObject(rawJson)
-    val themeName = root.optString("theme", AppThemeMode.DARK.name)
-    runCatching { AppThemeMode.valueOf(themeName) }.getOrNull()?.let(onThemeLoaded)
 
     val plArr = root.optJSONArray("playlists")
     if (plArr != null) {
